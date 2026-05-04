@@ -1,0 +1,582 @@
+---
+title: "Comparing mixed ANOVA and linear mixed models for the classical therapy evaluation design"
+subtitle: "Vergleich von linear mixed models und mixed effects ANOVA zur Analyse des klassischen Therapie-Evaluationsdesigns"
+author: "Jamie Cummins"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.5, fig.align = "center",
+  dpi = 110
+)
+```
+
+# Welcome — what this lecture is really about
+
+Imagine your supervisor hands you a dataset. It's a clean, well-run trial: 128 patients with moderate depression, randomly assigned to either *Standard Care* or a *New Treatment* — a new short-term therapy the clinic is evaluating. Everyone is measured at the start (**baseline**) and again 12 weeks later (**post-treatment**). You're asked one thing: *did the new treatment work?*
+
+For about forty years, the textbook answer to that question has been a 2 × 2 **mixed-effects ANOVA**: time (baseline vs post) within-subjects, group (Standard Care vs New Treatment) between-subjects, and the time × group **interaction** as the test of whether the new treatment added anything beyond what Standard Care did.
+
+This lecture demonstrates
+
+1. The classic mixed ANOVA is a *special case* of a more general tool called the **linear mixed model** (LMM, also called *multilevel model*). 
+
+2. In many cases, the similarity of ANOVA and multilevel models breaks because the classical therapy design almost never meets the required assumptions — most importantly, it assumes patients are independent of each other. They aren't, because patients are seen by **therapists**, and therapists differ. We will see that ignoring this leads to *false positives* in clinical trial data — purely because of the wrong analysis choice.
+
+By the end of this notebook, you should be able to:
+
+- describe the components of the classical therapy evaluation design (a randomized controlled trial),
+- distinguish between fixed effects and random effects, and between random intercepts and random slopes,
+- contrast how mixed ANOVA and multilevel models handle fixed vs. random effects, and
+- demonstrate how failing to model important random effects can inflate Type I error.
+
+```{r libraries}
+library(tidyverse)
+library(lme4)        # lmer()
+library(lmerTest)    # p-values for lmer
+library(afex)        # aov_ez() — classical mixed ANOVA
+library(patchwork)   # combining plots
+library(knitr)
+
+theme_set(theme_minimal(base_size = 12) +
+            theme(panel.grid.minor = element_blank(),
+                  plot.title      = element_text(face = "bold"),
+                  panel.spacing   = unit(1.4, "lines"),               # gap between facet panels
+                  plot.margin     = margin(t = 6, r = 10, b = 6, l = 10)))  # gap around each plot in patchwork
+
+group_palette <- c("Standard Care" = "#4E79A7", "New Treatment" = "#E15759")
+```
+
+---
+
+# Eight therapists, 128 patients
+
+To make the abstract concrete, we'll work with one running example throughout the lecture. **There are eight therapists, four trained in Standard Care and four in the new treatment.** Each therapist sees 16 patients in their assigned protocol — so the design is perfectly balanced (128 patients, 256 observations) with 64 patients per arm. This *nested* design — therapists trained on one protocol or the other but not both — is standard practice in psychotherapy trials, where it avoids contamination between conditions.
+
+What differs between therapists is two things: *the kind of patients who walk through their door*, and *how much their patients change over time*. Real clinics look like this. We'll capture this with two therapist-level random effects:
+
+- **`u0_th`** — *how depressed are this therapist's patients on average?* (positive = more severe; negative = milder). Some therapists' patients arrive severely depressed; others see milder cases.
+- **`u_time`** — *how much do this therapist's patients change between baseline and post-treatment?* Therapists vary in this — some are more activating, get better engagement, build stronger rapport, or simply have better outcomes regardless of the protocol they apply.
+
+These two numbers — the *therapist intercept* and the *therapist time slope* — are the heart of this lecture. Hold onto them.
+
+```{r data-generator}
+simulate_therapy <- function(
+  n_therapists_per_arm         = 4,
+  n_patients_per_therapist     = 16,
+  fixed_intercept              = 25,   # mean Standard Care baseline (e.g. BDI score)
+  time_effect                  = -3,   # natural improvement (regression to mean, expectancy)
+  group_effect                 = 0,    # baseline difference (randomisation: ~ 0)
+  interaction_effect           = -5,   # AVERAGE treatment effect of new treatment
+  sd_participant               = 4,    # individual baseline differences (matches slide 44)
+  sd_residual                  = 3,    # measurement error
+  sd_therapist_intercept       = 4,    # SD of u0_th
+  sd_therapist_time_slope      = 2,    # SD of u_time -- variation in pre-post change
+  seed                         = 42
+) {
+  set.seed(seed)
+
+  # Therapists nested in arms: each therapist delivers ONLY ONE protocol.
+  therapists <- tibble(
+    therapist_id = sprintf("T%02d", seq_len(2 * n_therapists_per_arm)),
+    group        = rep(c("Standard Care", "New Treatment"),
+                       each = n_therapists_per_arm),
+    u0_th        = rnorm(2 * n_therapists_per_arm, 0, sd_therapist_intercept),
+    u_time       = rnorm(2 * n_therapists_per_arm, 0, sd_therapist_time_slope)
+  )
+
+  participants <- therapists |>
+    expand_grid(rep = seq_len(n_patients_per_therapist)) |>
+    mutate(participant_id = factor(sprintf("P%04d", row_number())),
+           u_p            = rnorm(n(), 0, sd_participant),
+           x_offset       = rnorm(n(), 0, 0.08)) |>     # per-participant horizontal jitter, fixed across plots
+    select(-rep)
+
+  participants |>
+    expand_grid(time = c("Baseline", "Post")) |>
+    mutate(
+      group    = factor(group, levels = c("Standard Care", "New Treatment")),
+      time     = factor(time,  levels = c("Baseline", "Post")),
+      time_n   = as.integer(time  == "Post"),
+      group_n  = as.integer(group == "New Treatment"),
+      y = fixed_intercept +
+          u0_th + u_p +
+          time_effect       * time_n +
+          u_time            * time_n +    # therapist-level variation in TIME effect
+          group_effect      * group_n +
+          interaction_effect* time_n * group_n +
+          rnorm(n(), 0, sd_residual)
+    )
+}
+
+dat <- simulate_therapy(seed = 42)
+```
+
+Quick sanity check on the data:
+
+```{r sanity-check}
+dat |>
+  group_by(group, time) |>
+  summarise(mean = mean(y), sd = sd(y), n = n(), .groups = "drop") |>
+  kable(digits = 2, caption = "Mean depression score by cell")
+```
+
+Lower is better. Both groups improve from baseline to post, but the new-treatment group improves more — exactly what we'd hope to see in a successful trial. That **extra** improvement is the treatment effect we want to test.
+
+---
+
+# Building the picture, one piece at a time
+
+Before we run any models, let's understand what we're modelling. We'll add one piece at a time, and each picture will introduce one new idea.
+
+## P1 — Just the Standard Care patients at baseline
+
+We start at the simplest possible place: forget the new treatment for a moment, and just look at the Standard Care group at baseline. Each dot is one patient's depression score.
+
+```{r P1-data}
+ctrl_base <- dat |> filter(group == "Standard Care", time == "Baseline")
+mu_ctrl_base <- mean(ctrl_base$y)
+```
+
+### P1A — the raw data
+
+```{r P1A, fig.height=4.2}
+p1a <- ggplot(ctrl_base, aes(x = 1 + x_offset, y = y)) +
+  geom_point(alpha = 0.75, colour = group_palette["Standard Care"]) +
+  scale_x_continuous(limits = c(0.4, 1.6), breaks = NULL, name = NULL) +
+  labs(y = "Depression score (BDI)")
+p1a
+```
+
+There's a cloud of dots. Patients differ from each other.
+
+### P1B — adding the simplest "model": the average
+
+The most basic thing we can do is summarise the cloud with one number: the average. That single number is what statisticians call the **intercept** — the baseline value the model "starts from" before we add anything else.
+
+```{r P1B, fig.height=4.2}
+p1b <- p1a +
+  geom_hline(yintercept = mu_ctrl_base, colour = "black", linewidth = 1) +
+  annotate("text", x = 1.5, y = mu_ctrl_base,
+           label = sprintf("average = %.1f", mu_ctrl_base),
+           hjust = 1, vjust = -0.6)
+p1b
+```
+
+That's our first parameter: *roughly how depressed are Standard Care patients at baseline?* About `r round(mu_ctrl_base, 1)` on the BDI scale. Done.
+
+## P2 — Standard Care patients at both timepoints
+
+Now let's add the second timepoint. The same Standard Care patients are measured 12 weeks later. We want to see whether they get better just from being in the trial (time, expectancy effects, regression to the mean — but no active therapy beyond Standard Care).
+
+```{r P2-data}
+ctrl_both <- dat |> filter(group == "Standard Care")
+ctrl_means <- ctrl_both |> group_by(time) |> summarise(m = mean(y), .groups = "drop")
+```
+
+### P2A — raw data with cell means marked
+
+```{r P2A, fig.height=4.2}
+ctrl_both <- ctrl_both |>
+  mutate(time_num = as.integer(time),
+         x_plot   = time_num + x_offset)
+ctrl_means <- ctrl_means |>
+  mutate(time_num = as.integer(time))
+
+p2a <- ggplot(ctrl_both, aes(x = x_plot, y = y)) +
+  geom_point(alpha = 0.55, colour = group_palette["Standard Care"]) +
+  geom_point(data = ctrl_means, aes(x = time_num, y = m),
+             size = 4, shape = 18, colour = "black") +
+  scale_x_continuous(breaks = c(1, 2), labels = c("Baseline", "Post")) +
+  labs(y = "Depression score (BDI)", x = NULL)
+p2a
+```
+
+The diamond at "Post" sits a bit lower than the diamond at "Baseline". That's the **time effect** — how much Standard Care patients improve on average, even without the new treatment. It's there in many real trials, and it's why we need a control group at all.
+
+### P2B — drawing the time effect as a line
+
+```{r P2B, fig.height=4.2}
+p2b <- p2a +
+  geom_line(data = ctrl_means, aes(x = time_num, y = m, group = 1),
+            colour = "black", linewidth = 1)
+p2b
+```
+
+The slope of that line is our second parameter. Two pictures in, we already have the rough story: *patients start somewhere, and they drift downwards a little even without the new treatment.*
+
+## P3 — both groups, both timepoints, with within-patient lines
+
+Now we add the new-treatment group, and the picture finally becomes the classical 2 × 2 therapy design.
+
+The thin coloured lines connect each patient's two measurements. The two thick lines are the cell means.
+
+```{r P3, fig.height=4.6}
+group_means <- dat |> group_by(group, time) |>
+  summarise(m = mean(y), .groups = "drop") |>
+  mutate(time_num = as.integer(time))
+
+dat_plot <- dat |>
+  mutate(time_num = as.integer(time),
+         x_plot   = time_num + x_offset)
+
+p3 <- ggplot(dat_plot, aes(x = x_plot, y = y, colour = group, group = participant_id)) +
+  geom_line(alpha = 0.18) +
+  geom_point(alpha = 0.45, size = 1.3) +
+  geom_line(data = group_means, inherit.aes = FALSE,
+            aes(x = time_num, y = m, group = group), linewidth = 1.4, colour = "black") +
+  geom_line(data = group_means, inherit.aes = FALSE,
+            aes(x = time_num, y = m, group = group, colour = group), linewidth = 1.0) +
+  geom_point(data = group_means, inherit.aes = FALSE,
+             aes(x = time_num, y = m), size = 3.2, shape = 18, colour = "black") +
+  scale_colour_manual(values = group_palette) +
+  scale_x_continuous(breaks = c(1, 2), labels = c("Baseline", "Post")) +
+  labs(y = "Depression score (BDI)", x = NULL, colour = "Group") +
+  theme(legend.position = "bottom")
+p3
+```
+
+Two things to notice:
+
+1. **The two thick lines aren't parallel.** The red line drops more steeply than the blue line. That non-parallelism is the **interaction**, and it is the *only* thing in this whole design that says "the new treatment worked beyond Standard Care". Everything else — the time effect, the baseline group difference — would be there even with no real therapy.
+
+2. **The thin lines are not independent.** Each patient appears twice. A patient who starts high tends to end high. If we ignored this, we'd be treating 256 connected observations as if they were 256 strangers. They aren't, and the analysis has to account for that.
+
+That second point is the entire reason this design needs *anything* fancier than a t-test. The two standard answers are:
+
+- the **mixed-effects ANOVA**, which has been taught in psychology departments forever, and
+- the **linear mixed model**, which is what we'd use today.
+
+Let's run both.
+
+---
+
+# The mixed-effects ANOVA — the textbook answer
+
+```{r mixed-anova}
+aov_fit <- aov_ez(
+  id     = "participant_id",
+  dv     = "y",
+  within = "time",
+  between= "group",
+  data   = dat
+)
+aov_fit
+```
+
+In English: *the time × group interaction is significant.* The new treatment beats Standard Care.
+
+# The linear mixed model — same answer, written differently
+
+The same model, written in modern mixed-model notation, is one line:
+
+```{r lmm-participant}
+lmm_p <- lmer(y ~ time * group + (1 | participant_id), data = dat)
+anova(lmm_p)
+```
+
+Notice the `(1 | participant_id)` term. In words: *let each patient have their own intercept — their own personal baseline — so the model knows the two measurements from one patient are connected.* That single piece of syntax is doing exactly the same job that "within-subject factor" does in the ANOVA framework.
+
+## The two are literally the same model
+
+In a balanced 2 × 2 design with no missing data, the F-statistic for the treatment effect from the mixed ANOVA and from this LMM are *numerically identical*:
+
+```{r equivalence}
+aov_F <- aov_fit$anova_table["group:time", "F"]
+lmm_F <- anova(lmm_p)["time:group", "F value"]
+
+tibble(
+  Method = c("Mixed ANOVA",
+             "LMM with (1|participant_id)"),
+  F      = c(aov_F, lmm_F)
+) |> kable(digits = 4, caption = "Identical F for the treatment effect")
+```
+
+**Take-home for this section.** "Mixed ANOVA vs. LMM" is *not* a real choice in this design. The mixed ANOVA *is* an LMM with a random intercept for patient. If they're the same, why bother with LMM? Because the LMM lets us do something the ANOVA framework can't — and it turns out the therapy design needs us to do it.
+
+---
+
+# The thing the ANOVA cannot see: therapists
+
+So far we've pretended every patient is an independent person who walks into a clinic and gets a therapy. That's the assumption built into the mixed ANOVA. But our 128 patients aren't independent. They're seen by **eight therapists**, and those therapists are different from each other in two important ways.
+
+Concretely:
+
+- **Some therapists see sicker patients than others.** A trauma specialist's patients start out *much sicker* than a junior community-clinic clinician's milder caseload. So at baseline, two patients picked at random from one therapist's roster look more like each other than two patients picked from across the whole clinic.
+- **Therapists differ in how much their patients change over time.** Some therapists are simply more activating, build stronger rapport, or have better engagement — and their patients improve more, regardless of which protocol they're delivering. Others see less change in their patients. So *the size of the change itself* depends on which therapist a patient happened to be assigned to.
+
+In statistical language: the patients are **clustered** within therapists. The mixed ANOVA does not have a slot for that — it only knows about *patient* and the two fixed factors. The LMM does. Below we visualise the three canonical ways therapists can vary, and fit each one.
+
+## P4 — Random intercept only: therapists differ in how sick their patients are
+
+This is the simplest kind of therapist effect. Imagine all therapists got the same amount of change out of their patients — same slope from baseline to post-treatment. They'd still differ in one thing: their patients arrive at very different starting points. Some therapists' patients average around 30, others around 22.
+
+So if we plotted each therapist's predicted curves, they'd be **parallel** — every therapist has the same drop, just at a different altitude.
+
+```{r prediction-helper}
+therapist_grid <- function(model, data = dat) {
+  re_th <- as.data.frame(ranef(model)$therapist_id) |>
+    rownames_to_column("therapist_id")
+  if (!"(Intercept)" %in% names(re_th)) re_th[["(Intercept)"]] <- 0
+  if (!"time_n"      %in% names(re_th)) re_th[["time_n"]]      <- 0
+  re_th <- re_th |> rename(u0_th = `(Intercept)`, u_time = time_n)
+
+  # Each therapist is in exactly ONE arm in this nested design.
+  # Pull the therapist-group mapping from the data.
+  th_arm <- data |>
+    distinct(therapist_id, group)
+
+  fe <- fixef(model)
+
+  th_arm |>
+    expand_grid(time = factor(c("Baseline","Post"), levels = c("Baseline","Post"))) |>
+    mutate(time_post = as.integer(time  == "Post"),
+           group_tx  = as.integer(group == "New Treatment")) |>
+    left_join(re_th, by = "therapist_id") |>
+    mutate(
+      yhat = fe[["(Intercept)"]] +
+             fe[["timePost"]]                    * time_post +
+             fe[["groupNew Treatment"]]          * group_tx +
+             fe[["timePost:groupNew Treatment"]] * time_post * group_tx +
+             u0_th + u_time * time_post
+    )
+}
+
+fixed_curves <- function(model) {
+  fe <- fixef(model)
+  expand_grid(
+    time  = factor(c("Baseline","Post"),    levels = c("Baseline","Post")),
+    group = factor(c("Standard Care","New Treatment"),  levels = c("Standard Care","New Treatment"))
+  ) |>
+    mutate(time_post = as.integer(time  == "Post"),
+           group_tx  = as.integer(group == "New Treatment"),
+           yhat = fe[["(Intercept)"]] +
+                  fe[["timePost"]]                    * time_post +
+                  fe[["groupNew Treatment"]]          * group_tx +
+                  fe[["timePost:groupNew Treatment"]] * time_post * group_tx)
+}
+```
+
+```{r P4-fit}
+m_int  <- lmer(y ~ time * group + (1 | therapist_id) + (1 | participant_id), data = dat)
+preds_int <- therapist_grid(m_int)
+fix_int   <- fixed_curves(m_int)
+```
+
+```{r P4, fig.height=5}
+p4 <- ggplot(preds_int, aes(x = time, y = yhat, colour = group,
+                            group = interaction(group, therapist_id))) +
+  geom_line(alpha = 0.6) +
+  geom_line(data = fix_int, inherit.aes = FALSE,
+            aes(x = time, y = yhat, group = group), linewidth = 1.6, colour = "black") +
+  geom_line(data = fix_int, inherit.aes = FALSE,
+            aes(x = time, y = yhat, group = group, colour = group), linewidth = 1.1) +
+  scale_colour_manual(values = group_palette) +
+  labs(y = "Predicted depression score", x = NULL, colour = "Group") +
+  theme(legend.position = "bottom")
+p4
+```
+
+The thin lines are each therapist's predicted trajectories. They are **parallel within group**: every therapist gets the same drop, just at a different altitude. Some therapists sit high (severe patients); others sit low (milder patients). The thick lines are the *average* across all therapists — what the fixed-effect part of the model says.
+
+## P5 — Random slopes only: therapists differ in how much their patients change
+
+Now imagine the opposite: every therapist's 16 patients start at roughly the same severity, but therapists differ in *how much their patients change over 12 weeks*. Some therapists are more activating, build stronger rapport, get better engagement; their patients improve more. Other therapists' patients improve less, regardless of which protocol they're delivering.
+
+In the random-slope-only picture, therapist trajectories all start at the same baseline but **fan out** at post-treatment — therapists in each arm have visibly different slopes, even though they're all delivering the same protocol within their arm.
+
+```{r P5-fit}
+m_slp <- lmer(y ~ time * group + (0 + time_n | therapist_id) + (1 | participant_id), data = dat)
+preds_slp <- therapist_grid(m_slp)
+fix_slp   <- fixed_curves(m_slp)
+```
+
+```{r P5, fig.height=5}
+p5 <- ggplot(preds_slp, aes(x = time, y = yhat, colour = group,
+                            group = interaction(group, therapist_id))) +
+  geom_line(alpha = 0.6) +
+  geom_line(data = fix_slp, inherit.aes = FALSE,
+            aes(x = time, y = yhat, group = group), linewidth = 1.6, colour = "black") +
+  geom_line(data = fix_slp, inherit.aes = FALSE,
+            aes(x = time, y = yhat, group = group, colour = group), linewidth = 1.1) +
+  scale_colour_manual(values = group_palette) +
+  labs(title = "P5 — therapists differ only in slopes",
+       subtitle = "Lines fan out within each arm — therapists vary in how much their patients change",
+       y = "Predicted depression score", x = NULL, colour = "Group") +
+  theme(legend.position = "bottom")
+p5
+```
+
+This is the picture that matters most for our analysis. It says: *patients improve on average, but how much they improve depends on who is delivering the therapy.* That clustering of patient outcomes within therapists is what the mixed ANOVA cannot represent.
+
+## P6 — Random intercept AND random slope: the realistic case
+
+Of course, the real world has both. Some therapists see sicker patients **and** see more or less change in their patients. A therapist with severe cases who also has a strong therapeutic style will sit high at baseline *and* show a steep drop; one with milder cases and a more passive style will sit low and show only modest change.
+
+```{r P6-fit}
+m_full <- lmer(y ~ time * group + (1 + time_n | therapist_id) + (1 | participant_id), data = dat)
+preds_full <- therapist_grid(m_full)
+fix_full   <- fixed_curves(m_full)
+```
+
+```{r P6, fig.height=5}
+p6 <- ggplot(preds_full, aes(x = time, y = yhat, colour = group,
+                             group = interaction(group, therapist_id))) +
+  geom_line(alpha = 0.6) +
+  geom_line(data = fix_full, inherit.aes = FALSE,
+            aes(x = time, y = yhat, group = group), linewidth = 1.6, colour = "black") +
+  geom_line(data = fix_full, inherit.aes = FALSE,
+            aes(x = time, y = yhat, group = group, colour = group), linewidth = 1.1) +
+  scale_colour_manual(values = group_palette) +
+  labs(title = "P6 — therapists differ in BOTH starting level and slopes",
+       subtitle = "Lines start at different heights AND fan out at Post",
+       y = "Predicted depression score", x = NULL, colour = "Group") +
+  theme(legend.position = "bottom")
+p6
+```
+
+```{r P4-P6-side-by-side, fig.width=13, fig.height=5}
+(p4 + theme(legend.position = "none") + labs(subtitle = "P4: intercept only")) +
+  (p5 + theme(legend.position = "none") + labs(subtitle = "P5: slope only")) +
+  (p6 + theme(legend.position = "bottom") + labs(subtitle = "P6: both")) +
+  plot_layout(ncol = 3)
+```
+
+The mixed ANOVA cannot represent **any** of these three pictures, because it has no concept of "therapist" as a level. The LMM represents all three, and tells us which one fits the data best.
+
+---
+
+# Our example simulation
+
+So far this could feel academic: yes, ANOVA and LMM are different in principle, but does it matter in practice? The honest test is to simulate trials where we *know* there's no real treatment effect (so any "significant" result is a false positive), and see how often each method falsely rejects.
+
+Before we run anything, here's our reference. *If* a test is correctly calibrated and the null is true, every value of p between 0 and 1 is equally likely. Across many simulated trials, the histogram of p-values should be flat. This is what we are hoping each method produces:
+
+```{r ref-uniform, fig.height=3.2}
+set.seed(1)
+n_ref <- 2000
+expected_per_bin <- n_ref * 0.05   # binwidth = 0.05  ->  ~5% of trials per bin
+tibble(p = runif(n_ref)) |>
+  ggplot(aes(x = p)) +
+  geom_histogram(boundary = 0, binwidth = 0.05,
+                 fill = "grey70", colour = "white") +
+  geom_hline(yintercept = expected_per_bin,
+             colour = "black", linetype = "dotted") +
+  geom_vline(xintercept = 0.05, linetype = "dashed") +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  labs(
+       x = "p-value", y = "Count")
+```
+
+About 5% of bars sit to the left of the dashed line — that's the nominal Type I error rate of 0.05. *That's the picture we want every method to produce when no real effect exists.* Now let's see what each method actually does.
+
+```{r simulation, cache=TRUE}
+run_one <- function(rep,
+                    interaction_effect      = 0,   # NULL: no real effect
+                    sd_therapist_time_slope = 2) {
+  d <- simulate_therapy(
+    interaction_effect      = interaction_effect,
+    sd_therapist_time_slope = sd_therapist_time_slope,
+    seed                    = rep
+  )
+
+  aov_p <- suppressMessages(
+    aov_ez(id="participant_id", dv="y", within="time", between="group", data=d)
+  )$anova_table["group:time", "Pr(>F)"]
+
+  lmm_int <- suppressMessages(suppressWarnings(
+    lmer(y ~ time * group + (1|therapist_id) + (1|participant_id),
+         data = d, REML = TRUE)
+  ))
+  lmm_int_p <- anova(lmm_int)["time:group", "Pr(>F)"]
+
+  lmm_full <- suppressMessages(suppressWarnings(
+    lmer(y ~ time * group + (1 + time_n | therapist_id) + (1|participant_id),
+         data = d, REML = TRUE)
+  ))
+  lmm_full_p <- anova(lmm_full)["time:group", "Pr(>F)"]
+
+  tibble(rep = rep,
+         mixed_anova                    = aov_p,
+         lmm_random_intercept_therapist = lmm_int_p,
+         lmm_full_random                = lmm_full_p)
+}
+
+n_sims <- 20000
+sim_results <- map_dfr(seq_len(n_sims), run_one)
+
+type1 <- sim_results |>
+  pivot_longer(-rep, names_to = "method", values_to = "p") |>
+  group_by(method) |>
+  summarise(`False positive rate (α = .05)` = mean(p < .05),
+            .groups = "drop") |>
+  mutate(method = recode(method,
+                         "mixed_anova"                    = "Mixed ANOVA (ignores therapist)",
+                         "lmm_random_intercept_therapist" = "LMM (1|therapist) — intercept only",
+                         "lmm_full_random"                = "LMM (1+time|therapist) — full")) |>
+  arrange(desc(`False positive rate (α = .05)`))
+
+type1 |> kable(digits = 3,
+               caption = sprintf("False-positive rate across %d simulated NULL trials (true effect = 0)", n_sims))
+```
+
+Read that table carefully. We *built* the data with no treatment effect, so a properly working test should reject 5% of the time and no more. The mixed ANOVA rejects far more often. *Every single one of those extra rejections is a false claim that the new treatment works, when in our simulation it does not.*
+
+```{r sim-plot, fig.height=4}
+sim_results |>
+  pivot_longer(-rep, names_to = "method", values_to = "p") |>
+  mutate(method = recode(method,
+                         "mixed_anova"                    = "ANOVA",
+                         "lmm_random_intercept_therapist" = "MLM intercept-only",
+                         "lmm_full_random"                = "MLM slope+intercept")) |>
+  ggplot(aes(x = p, fill = method)) +
+  geom_histogram(boundary = 0, binwidth = 0.05, colour = "white") +
+  geom_vline(xintercept = 0.05, linetype = "dashed") +
+  facet_wrap(~ method) +
+  labs(x = "p-value (interaction effect)", y = "Count") +
+  theme(legend.position = "none")
+
+```
+
+The mixed ANOVA's histogram piles up on the left. That pile is the false-positive problem made visible.
+
+A subtle but important detail: adding *only* a random intercept for therapist barely helps in this perfectly balanced 2 × 2 design — because the therapist's "starting level" cancels out when we look at *change* within each patient. What the data actually need is the therapist **slope** — the acknowledgement that therapists vary in how much their patients change over time. Only the full structure recovers the right false-positive rate.
+
+---
+
+# Why an LMM is the more appropriate tool
+
+The mixed ANOVA assumes patients are independent — every patient is statistically a stranger to every other. In real therapy data, patients are clustered in therapists, sites, hospitals, schools, families. Two patients seen by the same therapist are more similar to each other than two patients picked at random from across the whole clinic. *That violation is what broke the simulation above.*
+
+The LMM was specifically designed to handle this. Adding `(1 | therapist_id)` lets each therapist have their own baseline; adding `(1 + time_n | therapist_id)` additionally lets each therapist have their own pre-post change. Once those random effects are in the model, the standard error for the time × group interaction reflects the *therapist-level* variability that actually drives our uncertainty — not the patient-level noise that ANOVA wrongly leans on.
+
+Beyond clustering, the LMM has three further advantages worth knowing about:
+
+- **Missing data** is handled gracefully — LMM uses all observed data under MAR (missing-at-random), no listwise deletion.
+- **Continuous time** opens the door to growth-curve models, follow-ups, and individual trajectories.
+- **Generalised LMMs (GLMMs)** extend to binary outcomes (relapse yes/no), counts (sessions attended), ordinal scales, and so on.
+
+---
+
+# Three sentences to take home
+
+1. **Mixed ANOVA *is* an LMM with a random intercept for patient.** One is a special case of the other.
+
+2. **The classical therapy evaluation design rarely satisfies the assumption that special case rests on**, because patients are clustered in therapists who differ in skill — not just in the kinds of patients they see.
+
+3. **Default to the LMM.** When the data turn out to be simple — no clustering, no missing data, equal variances — it gives you exactly the same answer as the ANOVA. When the data turn out to be complicated, it gives you the *right* answer.
+
+```{r session, include=FALSE}
+sessionInfo()
+```
